@@ -11,7 +11,33 @@ from torch import nn
 from torch.utils.data import DataLoader
 
 import tqdm
-import wandb
+try:
+    import wandb  # type: ignore
+except Exception:
+    class _WandbShim:
+        class Settings:
+            def __init__(self, *_args, **_kwargs):
+                pass
+
+        run = None
+
+        @staticmethod
+        def init(*_args, **_kwargs):
+            return None
+
+        @staticmethod
+        def log(*_args, **_kwargs):
+            pass
+
+        @staticmethod
+        def finish(*_args, **_kwargs):
+            pass
+
+        @staticmethod
+        def login(*_args, **_kwargs):
+            pass
+
+    wandb = _WandbShim()  # type: ignore
 import coolname
 import hydra
 import pydantic
@@ -385,18 +411,30 @@ def launch(hydra_config: DictConfig):
     # Initialize distributed training if in distributed environment (e.g. torchrun)
     if "LOCAL_RANK" in os.environ:
         # Initialize distributed, default device and dtype
-        dist.init_process_group(backend="nccl")
+        try:
+            dist.init_process_group(backend="nccl")
+        except Exception:
+            # Fallback for environments where NCCL is unavailable
+            dist.init_process_group(backend="gloo")
 
         RANK = dist.get_rank()
         WORLD_SIZE = dist.get_world_size()
 
-        torch.cuda.set_device(int(os.environ["LOCAL_RANK"]))
+        if torch.cuda.is_available():
+            torch.cuda.set_device(int(os.environ.get("LOCAL_RANK", "0")))
         
     # Load sync'ed config
     config = load_synced_config(hydra_config, rank=RANK, world_size=WORLD_SIZE)
 
     # Seed RNGs to ensure consistency
     torch.random.manual_seed(config.seed + RANK)
+
+    # W&B setup (optional for Kaggle / offline)
+    wandb_enabled = True
+    if os.environ.get("WANDB_DISABLED", "").lower() in ("1", "true", "yes"):
+        wandb_enabled = False
+    if os.environ.get("WANDB_MODE", "").lower() in ("offline", ):
+        wandb_enabled = False
 
     # Dataset
     train_epochs_per_iter = config.eval_interval if config.eval_interval is not None else config.epochs
@@ -415,9 +453,13 @@ def launch(hydra_config: DictConfig):
     if RANK == 0:
         progress_bar = tqdm.tqdm(total=train_state.total_steps)
 
-        wandb.init(project=config.project_name, name=config.run_name, config=config.model_dump(), settings=wandb.Settings(_disable_stats=True))  # type: ignore
-        wandb.log({"num_params": sum(x.numel() for x in train_state.model.parameters())}, step=0)
-        save_code_and_config(config)
+        if wandb_enabled:
+            try:
+                wandb.init(project=config.project_name, name=config.run_name, config=config.model_dump(), settings=wandb.Settings(_disable_stats=True))  # type: ignore
+                wandb.log({"num_params": sum(x.numel() for x in train_state.model.parameters())}, step=0)
+                save_code_and_config(config)
+            except Exception:
+                wandb_enabled = False
 
     # Training Loop
     for _iter_id in range(total_iters):
@@ -429,7 +471,8 @@ def launch(hydra_config: DictConfig):
             metrics = train_batch(config, train_state, batch, global_batch_size, rank=RANK, world_size=WORLD_SIZE)
 
             if RANK == 0 and metrics is not None:
-                wandb.log(metrics, step=train_state.step)
+                if wandb_enabled:
+                    wandb.log(metrics, step=train_state.step)
                 progress_bar.update(train_state.step - progress_bar.n)  # type: ignore
 
         ############ Evaluation
@@ -437,7 +480,8 @@ def launch(hydra_config: DictConfig):
         metrics = evaluate(config, train_state, eval_loader, eval_metadata, rank=RANK, world_size=WORLD_SIZE)
 
         if RANK == 0 and metrics is not None:
-            wandb.log(metrics, step=train_state.step)
+            if wandb_enabled:
+                wandb.log(metrics, step=train_state.step)
             
         ############ Checkpointing
         if RANK == 0 and (config.checkpoint_every_eval or (_iter_id == total_iters - 1)):
@@ -446,7 +490,8 @@ def launch(hydra_config: DictConfig):
     # finalize
     if dist.is_initialized():
         dist.destroy_process_group()
-    wandb.finish()
+    if 'wandb_enabled' in locals() and wandb_enabled and wandb.run is not None:
+        wandb.finish()
 
 
 if __name__ == "__main__":
