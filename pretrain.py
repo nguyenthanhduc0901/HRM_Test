@@ -168,15 +168,33 @@ def create_model(config: PretrainConfig, train_metadata: PuzzleDatasetMetadata, 
             weight_decay=config.puzzle_emb_weight_decay,
 
             world_size=world_size
-        ),
-        AdamATan2(
-            model.parameters(),
-
-            lr=0,  # Needs to be set by scheduler
-            weight_decay=config.weight_decay,
-            betas=(config.beta1, config.beta2)
         )
     ]
+
+    # Adam optimizer selection: default to AdamATan2, allow fallback to AdamW via env
+    use_adamw = os.environ.get("HRM_FORCE_ADAMW", "").lower() in ("1", "true", "yes")
+    if not use_adamw:
+        try:
+            optimizers.append(
+                AdamATan2(
+                    model.parameters(),
+                    lr=0,  # Needs to be set by scheduler
+                    weight_decay=config.weight_decay,
+                    betas=(config.beta1, config.beta2)
+                )
+            )
+        except Exception:
+            use_adamw = True
+
+    if use_adamw:
+        optimizers.append(
+            torch.optim.AdamW(
+                model.parameters(),
+                lr=0,  # Needs to be set by scheduler
+                weight_decay=config.weight_decay,
+                betas=(config.beta1, config.beta2)
+            )
+        )
     optimizer_lrs = [
         config.puzzle_emb_lr,
         config.lr
